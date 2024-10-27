@@ -1,2 +1,2 @@
 # ScratchCV
-A collection of jupyter-notebooks solving various computer vision tasks from scratch
+A collection of jupyter-notebooks solving various computer vision tasks from scratch in Python using only NumPy.
