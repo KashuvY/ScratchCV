@@ -1,0 +1,12 @@
+Metadata-Version: 2.1
+Name: cv_lib
+Version: 0.1.0
+Summary: A computer vision library built from scratch
+Author: Your Name
+Requires-Python: >=3.8,<3.9
+License-File: LICENSE
+Requires-Dist: numpy<2.0.0,>=1.21.0
+Requires-Dist: matplotlib<4.0.0,>=3.4.0
+Requires-Dist: opencv-python>=4.5.0
+Requires-Dist: scikit-image<0.22.0,>=0.18.0
+Requires-Dist: Pillow>=8.0.0

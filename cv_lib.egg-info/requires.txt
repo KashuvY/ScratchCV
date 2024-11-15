@@ -1,0 +1,5 @@
+numpy<2.0.0,>=1.21.0
+matplotlib<4.0.0,>=3.4.0
+opencv-python>=4.5.0
+scikit-image<0.22.0,>=0.18.0
+Pillow>=8.0.0
