@@ -74,13 +74,28 @@ class Image:
         return result
     
     def to_grayscale(self) -> 'Image':
-        """Convert to grayscale if color."""
+        """Convert image to grayscale using standard luminance weights.
+        
+        Returns:
+            Image: Grayscaled version of the image with values in [0, 1] range.
+        """
         if self.is_grayscale():
             return self
+            
+        # Ensure input data is in float range [0, 1]
+        rgb_data = self._data[..., :3].astype(np.float32)
+        if rgb_data.max() > 1.0:
+            rgb_data /= 255.0
+        
         # Using standard RGB to grayscale conversion weights
         weights = np.array([0.299, 0.587, 0.114])
-        gray_data = np.dot(self._data[..., :3], weights)
-        return Image(gray_data[..., np.newaxis], normalize=False)
+        gray_data = np.dot(rgb_data, weights)
+        
+        # Ensure output is in correct shape and range
+        gray_data = np.clip(gray_data, 0, 1)
+        gray_data = gray_data[..., np.newaxis]
+        
+        return Image(gray_data, normalize=False)
     
     def clip(self) -> 'Image':
         """Clip values to valid range [0,1]."""
@@ -101,7 +116,13 @@ class Image:
     def show(self) -> None:
         """Display the image."""
         plt.figure(figsize=(8, 8))
-        plt.imshow(self._data)
+        
+        # Use grayscale colormap for single-channel images
+        if self.is_grayscale():
+            plt.imshow(self._data.squeeze(), cmap='gray')  # squeeze removes single-channel dimension
+        else:
+            plt.imshow(self._data)
+            
         plt.axis('off')
         plt.show()
     
@@ -114,14 +135,14 @@ class Image:
         return self._data
     
     def resize(self, new_height: int, new_width: int) -> 'Image':
-        """Resize the image using improved interpolation.
+        """Resize the image using bilinear interpolation.
         
         Args:
             new_height (int): Target height in pixels
             new_width (int): Target width in pixels
             
         Returns:
-            Image: Resized image with improved quality
+            Image: Resized image
         """
         if new_height <= 0 or new_width <= 0:
             raise ValueError("New dimensions must be positive")
@@ -129,48 +150,33 @@ class Image:
         old_height, old_width = self._data.shape[:2]
         num_channels = self._data.shape[2]
         
-        # Compute scale factors
+        # Create coordinate matrices for the output image
         x_ratio = old_width / new_width
         y_ratio = old_height / new_height
         
-        # Create coordinate matrices for the output image with subpixel precision
-        x_coords = np.linspace(0, old_width - 1, new_width)
-        y_coords = np.linspace(0, old_height - 1, new_height)
+        # Create meshgrid for the new coordinates
+        x_coords = np.arange(new_width)
+        y_coords = np.arange(new_height)
         x_mesh, y_mesh = np.meshgrid(x_coords, y_coords)
         
-        # Get the four nearest neighbors for each point
-        x0 = np.floor(x_mesh).astype(int)
+        # Calculate the corresponding source coordinates
+        x_src = x_mesh * x_ratio
+        y_src = y_mesh * y_ratio
+        
+        # Get the four nearest neighbor coordinates
+        x0 = np.floor(x_src).astype(int)
         x1 = np.minimum(x0 + 1, old_width - 1)
-        y0 = np.floor(y_mesh).astype(int)
+        y0 = np.floor(y_src).astype(int)
         y1 = np.minimum(y0 + 1, old_height - 1)
         
-        # Calculate interpolation weights with improved precision
-        wx = x_mesh - x0
-        wy = y_mesh - y0
+        # Calculate interpolation weights
+        wx = x_src - x0
+        wy = y_src - y0
         
-        # Add small epsilon to prevent floating point errors
-        wx = wx.clip(0, 1)
-        wy = wy.clip(0, 1)
-        
-        # Create output array with proper dtype
+        # Initialize output array
         resized = np.zeros((new_height, new_width, num_channels), dtype=self._data.dtype)
         
-        def cubic_weight(x):
-            """Cubic interpolation weight function using numpy.where()."""
-            x = np.abs(x)
-            result = np.zeros_like(x)
-            
-            # Region 1: 0 <= x <= 1
-            mask1 = x <= 1
-            result = np.where(mask1, 1.5 * x**3 - 2.5 * x**2 + 1, result)
-            
-            # Region 2: 1 < x < 2
-            mask2 = (x > 1) & (x < 2)
-            result = np.where(mask2, -0.5 * x**3 + 2.5 * x**2 - 4 * x + 2, result)
-            
-            return result
-            
-        # Perform improved interpolation for each channel
+        # Perform bilinear interpolation for each channel
         for c in range(num_channels):
             # Get values of four neighbors
             v00 = self._data[y0, x0, c]
@@ -178,32 +184,11 @@ class Image:
             v10 = self._data[y1, x0, c]
             v11 = self._data[y1, x1, c]
             
-            # Apply bicubic-inspired weighting for smoother interpolation
-            wx_cubic = wx  # Use linear interpolation weights instead
-            wy_cubic = wy
+            # Interpolate
+            top = v00 * (1 - wx) + v01 * wx
+            bottom = v10 * (1 - wx) + v11 * wx
+            resized[..., c] = top * (1 - wy) + bottom * wy
             
-            # Compute weighted averages
-            top = v00 * (1 - wx_cubic) + v01 * wx_cubic
-            bottom = v10 * (1 - wx_cubic) + v11 * wx_cubic
-            resized[..., c] = top * (1 - wy_cubic) + bottom * wy_cubic
-        
-        # Apply a subtle sharpening filter
-        if min(x_ratio, y_ratio) > 1:  # Only when downscaling
-            kernel = np.array([[-0.1, -0.1, -0.1],
-                             [-0.1,  1.8, -0.1],
-                             [-0.1, -0.1, -0.1]])
-            
-            padded = np.pad(resized, ((1, 1), (1, 1), (0, 0)), mode='edge')
-            filtered = np.zeros_like(resized)
-            
-            for i in range(resized.shape[0]):
-                for j in range(resized.shape[1]):
-                    for c in range(num_channels):
-                        window = padded[i:i+3, j:j+3, c]
-                        filtered[i, j, c] = np.sum(window * kernel)
-            
-            resized = np.clip(filtered, 0, 1)
-        
         return Image(resized, normalize=False)
     
     def rotate(self, angle: float) -> 'Image':
