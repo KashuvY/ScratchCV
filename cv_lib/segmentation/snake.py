@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 from scipy.interpolate import RectBivariateSpline  # Changed from interp2d
 from ..core.image import Image
 import cv2
+from scipy.ndimage import gaussian_filter
 
 def _is_in_jupyter() -> bool:
     """Check if code is running in Jupyter notebook/lab."""
@@ -24,12 +25,16 @@ def _is_in_jupyter() -> bool:
 @dataclass
 class SnakeParams:
     """Parameters for snake evolution."""
-    alpha: float = 0.1  # Tension parameter
-    beta: float = 0.1   # Rigidity parameter
-    gamma: float = .05  # Step size
+    alpha: float = 0.01    # Tension (reduced further)
+    beta: float = 0.1      # Rigidity
+    gamma: float = 0.5     # External force weight (increased significantly)
+    sigma: float = 2.0     # Gaussian smoothing
+    wline: float = 0.5     # Line weight
+    wedge: float = 2.0     # Edge weight (increased)
+    max_px_move: float = 1.0  # Maximum pixel movement per iteration
     max_iters: int = 100
     convergence_threshold: float = 0.1
-
+    
 class Snake:
     """Active contour model (snake) implementation for image segmentation."""
     
@@ -82,63 +87,67 @@ class Snake:
     
     def _compute_external_force(self) -> np.ndarray:
         """Compute external force field based on image gradient."""
-        print(f"Computing forces. Image shape: {self.image.data.shape}, dtype: {self.image.data.dtype}")
-        print(f"Image range: [{self.image.data.min()}, {self.image.data.max()}]")
+        # Ensure we're working with grayscale and normalize to [0, 1]
+        img_data = self.image.data[..., 0].astype(float)
+        img_data = (img_data - img_data.min()) / (img_data.max() - img_data.min() + 1e-8)
         
-        # Ensure we're working with grayscale
-        img_data = self.image.data[..., 0]
+        # Apply Gaussian smoothing to reduce noise
+        img_smooth = gaussian_filter(img_data, self.params.sigma)
         
-        # Compute gradient with Sobel
-        dx = cv2.Sobel(img_data, cv2.CV_64F, 1, 0, ksize=3)
-        dy = cv2.Sobel(img_data, cv2.CV_64F, 0, 1, ksize=3)
+        # Compute gradients using Sobel with larger kernel
+        dx = cv2.Sobel(img_smooth, cv2.CV_64F, 1, 0, ksize=5)
+        dy = cv2.Sobel(img_smooth, cv2.CV_64F, 0, 1, ksize=5)
         
-        # Gradient magnitude
-        gradient_magnitude = np.sqrt(dx**2 + dy**2)
-        print(f"Gradient magnitude range: [{gradient_magnitude.min()}, {gradient_magnitude.max()}]")
+        # Compute edge map
+        edge_map = np.sqrt(dx**2 + dy**2)
         
-        # Gaussian blur to smooth force field
-        from ..core.ops import Convolution, KernelType
-        conv = Convolution()
+        # Normalize edge map
+        edge_map = edge_map / (edge_map.max() + 1e-8)
         
-        # First smoothing of gradient magnitude
-        gradient_magnitude = conv.apply_kernel(
-            Image(gradient_magnitude[..., np.newaxis], normalize=False),
-            KernelType.GAUSSIAN,
-            size=5,
-            sigma=2.0
-        ).data[..., 0]
+        # Create combined external energy
+        E_line = img_smooth  # Line attraction
+        E_edge = edge_map    # Edge attraction
         
-        # Normalize gradient magnitude
-        gradient_magnitude = gradient_magnitude / (gradient_magnitude.max() + 1e-8)
+        # Combine external energies
+        E_ext = (self.params.w_line * E_line + 
+                self.params.w_edge * E_edge)
         
-        # Create edge map
-        edge_map = gradient_magnitude
+        # Compute external force field (GVF - Gradient Vector Flow)
+        fx = cv2.Sobel(E_ext, cv2.CV_64F, 1, 0, ksize=3)
+        fy = cv2.Sobel(E_ext, cv2.CV_64F, 0, 1, ksize=3)
         
-        # Double smoothing for better force field
-        edge_map = conv.apply_kernel(
-            Image(edge_map[..., np.newaxis], normalize=False),
-            KernelType.GAUSSIAN,
-            size=15,
-            sigma=3.0
-        ).data[..., 0]
+        # Apply GVF iteration to extend force field
+        fx, fy = self._gradient_vector_flow(fx, fy, mu=0.2, iterations=80)
         
-        # Compute forces as negative gradient of edge map
-        fx = cv2.Sobel(edge_map, cv2.CV_64F, 1, 0, ksize=3)
-        fy = cv2.Sobel(edge_map, cv2.CV_64F, 0, 1, ksize=3)
-        
-        # Normalize forces
+        # Normalize forces while preserving relative magnitudes
         magnitude = np.sqrt(fx**2 + fy**2)
         max_magnitude = magnitude.max()
         if max_magnitude > 0:
-            fx = fx / max_magnitude
-            fy = fy / max_magnitude
+            fx = self.params.kappa * fx / max_magnitude
+            fy = self.params.kappa * fy / max_magnitude
         
-        force_field = np.stack([-fx, -fy], axis=-1)
+        return np.stack([-fx, -fy], axis=-1)
+
+    def _gradient_vector_flow(self, fx: np.ndarray, fy: np.ndarray, 
+                            mu: float = 0.2, iterations: int = 80) -> Tuple[np.ndarray, np.ndarray]:
+        """Calculate Gradient Vector Flow (GVF) of force field."""
+        u = fx.copy()
+        v = fy.copy()
         
-        # Visualize the forces and edge map
-        self._visualize_forces(force_field, edge_map)
+        # Calculate magnitude of initial forces
+        f_squared = fx**2 + fy**2
         
-        return force_field
+        # Iterate to diffuse gradient field
+        for _ in range(iterations):
+            # Laplacian of u and v
+            u_laplace = cv2.Laplacian(u, cv2.CV_64F)
+            v_laplace = cv2.Laplacian(v, cv2.CV_64F)
+            
+            # Update u and v
+            u = u + mu * u_laplace - f_squared * (u - fx)
+            v = v + mu * v_laplace - f_squared * (v - fy)
+        
+        return u, v
     
     def _get_matrix_A(self, n_points: int) -> np.ndarray:
         """Construct matrix A for internal forces."""
@@ -265,102 +274,80 @@ class Snake:
         """Evolve the snake to minimize energy."""
         if self.snake_points is None:
             raise ValueError("Snake not initialized. Call initialize_interactive first.")
-            
-        # Debug: Show current image
-        plt.figure(figsize=(10, 10))
-        plt.imshow(self.original_image.data)
-        plt.plot(self.snake_points[:, 0], self.snake_points[:, 1], 'r-', label='Initial contour')
-        plt.title('Initial Snake Position')
-        plt.legend()
-        plt.show()
-            
+        
         # Compute external force field
-        print("Computing external forces...")
         force_field = self._compute_external_force()
         
         # Get matrix A for internal forces
         n_points = len(self.snake_points)
         A = self._get_matrix_A(n_points)
         
-        # Initialize solution matrix
-        B = np.eye(n_points) + self.params.gamma * A
+        # Initialize solution matrix with damping
+        gamma = self.params.gamma
+        B = np.eye(n_points) + gamma * A
         B_inv = np.linalg.inv(B)
         
-        # Evolution loop
-        self.evolution_history = [self.snake_points.copy()]
-        
-        # Setup interpolation
+        # Setup interpolation for external forces
         x = np.arange(force_field.shape[1])
         y = np.arange(force_field.shape[0])
         interpolator_x = RectBivariateSpline(y, x, force_field[..., 0])
         interpolator_y = RectBivariateSpline(y, x, force_field[..., 1])
         
-        if animate:
-            if not self.in_jupyter:
-                plt.ion()
-            
-            fig, ax = plt.subplots(figsize=(10, 10))
-            if self.original_image.is_color():
-                ax.imshow(self.original_image.data)
-            else:
-                ax.imshow(self.image.data[..., 0], cmap='gray')
-                
-            # Plot initial contour
-            current_points = np.vstack((self.snake_points, self.snake_points[0:1]))
-            line, = ax.plot(current_points[:, 0], current_points[:, 1], 'y-', linewidth=2)
-            plt.show(block=False)
-        
-        # Add momentum terms
+        # Evolution variables
+        self.evolution_history = [self.snake_points.copy()]
         prev_dx = np.zeros(n_points)
         prev_dy = np.zeros(n_points)
-        momentum = 0.3  # Momentum coefficient
+        momentum = 0.2  # Reduced momentum coefficient
         
-        for _ in range(self.params.max_iters):
+        # Setup animation if requested
+        if animate:
+            fig, ax = self._setup_animation()
+        
+        # Evolution loop
+        for iteration in range(self.params.max_iters):
             prev_points = self.snake_points.copy()
             
-            # Get external forces at snake points
+            # Get external forces at snake points using interpolation
             fx = interpolator_x.ev(self.snake_points[:, 1], self.snake_points[:, 0])
             fy = interpolator_y.ev(self.snake_points[:, 1], self.snake_points[:, 0])
             
-            # Add momentum
+            # Apply adaptive momentum based on convergence
+            if iteration > 10:
+                movement = np.mean(np.abs(self.snake_points - prev_points))
+                momentum = 0.2 * np.exp(-movement / self.params.convergence_threshold)
+            
+            # Add momentum with decay
             fx = fx + momentum * prev_dx
             fy = fy + momentum * prev_dy
             
             # Update snake points
-            new_x = B_inv @ (self.snake_points[:, 0] + self.params.gamma * fx)
-            new_y = B_inv @ (self.snake_points[:, 1] + self.params.gamma * fy)
+            new_x = B_inv @ (self.snake_points[:, 0] + gamma * fx)
+            new_y = B_inv @ (self.snake_points[:, 1] + gamma * fy)
             
             # Store momentum terms
             prev_dx = new_x - self.snake_points[:, 0]
             prev_dy = new_y - self.snake_points[:, 1]
             
-            # Update positions
+            # Update positions with bounds checking
             self.snake_points = np.column_stack([new_x, new_y])
-            
-            # Ensure snake points stay within image bounds
             self.snake_points[:, 0] = np.clip(self.snake_points[:, 0], 0, self.image.shape[1] - 1)
             self.snake_points[:, 1] = np.clip(self.snake_points[:, 1], 0, self.image.shape[0] - 1)
             
-            # Store for history
+            # Store history and update animation
             self.evolution_history.append(self.snake_points.copy())
-            
-            # Update animation
             if animate:
-                current_points = np.vstack((self.snake_points, self.snake_points[0:1]))
-                line.set_data(current_points[:, 0], current_points[:, 1])
-                if self.in_jupyter:
-                    fig.canvas.draw()
-                else:
-                    fig.canvas.draw_idle()
-                plt.pause(0.05)
+                self._update_animation(fig, ax)
             
-            # Check convergence
-            if np.mean(np.abs(self.snake_points - prev_points)) < self.params.convergence_threshold:
-                break
+            # Check convergence using windowed average
+            if iteration > 5:
+                recent_movement = np.mean([
+                    np.mean(np.abs(self.evolution_history[-i] - self.evolution_history[-i-1]))
+                    for i in range(1, min(6, len(self.evolution_history)))
+                ])
+                if recent_movement < self.params.convergence_threshold:
+                    break
         
         if animate:
-            if not self.in_jupyter:
-                plt.ioff()
             plt.close(fig)
         
         return self.snake_points
@@ -403,3 +390,32 @@ class Snake:
                 result.data[rr, cc] = 1
             
             result.save(filepath)
+    
+    def _setup_animation(self):
+        """Setup animation figure and axes."""
+        if not self.in_jupyter:
+            plt.ion()
+        fig, ax = plt.subplots(figsize=(10, 10))
+        if self.original_image.is_color():
+            ax.imshow(self.original_image.data)
+        else:
+            ax.imshow(self.image.data[..., 0], cmap='gray')
+        return fig, ax
+
+    def _update_animation(self, fig, ax):
+        """Update animation frame."""
+        ax.clear()
+        if self.original_image.is_color():
+            ax.imshow(self.original_image.data)
+        else:
+            ax.imshow(self.image.data[..., 0], cmap='gray')
+        
+        # Plot current snake position
+        current_points = np.vstack((self.snake_points, self.snake_points[0:1]))
+        ax.plot(current_points[:, 0], current_points[:, 1], 'y-', linewidth=2)
+        
+        if self.in_jupyter:
+            fig.canvas.draw()
+        else:
+            fig.canvas.draw_idle()
+        plt.pause(0.05)
