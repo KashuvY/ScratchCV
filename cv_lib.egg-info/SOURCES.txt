@@ -13,6 +13,8 @@ cv_lib/core/ops.py
 cv_lib/filters/__init__.py
 cv_lib/filters/denoising.py
 cv_lib/filters/noise.py
+cv_lib/segmentation/__init__.py
+cv_lib/segmentation/snake.py
 cv_lib/utils/__init__.py
 cv_lib/utils/io.py
 tests/__init__.py

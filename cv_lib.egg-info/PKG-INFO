@@ -10,3 +10,4 @@ Requires-Dist: matplotlib<4.0.0,>=3.4.0
 Requires-Dist: opencv-python>=4.5.0
 Requires-Dist: scikit-image<0.22.0,>=0.18.0
 Requires-Dist: Pillow>=8.0.0
+Requires-Dist: scipy
